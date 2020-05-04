@@ -1,11 +1,5 @@
 from __future__ import print_function
 
-import os
-import sys
-import re
-import json
-# import requests
-
 from requests import get, put
 from fcache.cache import FileCache
 
@@ -23,6 +17,8 @@ cf_headers = {
     "Content-Type": "application/json"
 }
 cf_baseurl = "https://api.cloudflare.com/client/v4"
+
+cache = FileCache("cloudflare_update", flag="cs", app_cache_dir="/tmp/cf_updater")
 
 
 def log(text: str):
@@ -42,27 +38,42 @@ def get_my_ip():
 
 
 def get_zone_id() -> str:
+    zone_id = cache.get("zone_id")
+
+    if zone_id is not None:
+        return zone_id
+
+    # else
     url = f"{cf_baseurl}/zones?name={zone_name}"
     response = get(url, headers=cf_headers)
     if response.status_code != 200:
-        return None
+        return ""
     response = response.json()
 
-    return [result.get("id") for result in response.get("result")].pop()
+    zone_id = [result.get("id") for result in response.get("result")].pop()
+    cache["zone_id"] = zone_id
+    return zone_id
 
 
 def get_record_id(zone_id: str, record_name: str) -> str:
-    url = f"{cf_baseurl}/zones/{zone_id}/dns_records?name={record_name}"
+    rec_id = cache.get(f"record_id_{record_name}")
 
+    if rec_id is not None:
+        return rec_id
+
+    # else
+    url = f"{cf_baseurl}/zones/{zone_id}/dns_records?name={record_name}"
     response = get(url, headers=cf_headers)
     if response.status_code != 200:
-        return None
+        return ""
     response = response.json()
 
-    return [result.get("id") for result in response.get("result")].pop()
+    rec_id = [result.get("id") for result in response.get("result")].pop()
+    cache[f"record_id_{record_name}"] = rec_id
+    return rec_id
 
 
-def update_domain_ip(zone_id: str, record_id: str, record_name: str, new_ip: str, with_cloud: bool = False) -> None:
+def update_domain_ip(zone_id: str, record_id: str, record_name: str, new_ip: str, proxied: bool = False) -> None:
     url = f"{cf_baseurl}/zones/{zone_id}/dns_records/{record_id}"
 
     data = {
@@ -70,7 +81,7 @@ def update_domain_ip(zone_id: str, record_id: str, record_name: str, new_ip: str
         "type": "A",
         "name": record_name,
         "content": new_ip,
-        "proxied": with_cloud,
+        "proxied": proxied,
     }
 
     response = put(url, json=data, headers=cf_headers)
@@ -79,40 +90,32 @@ def update_domain_ip(zone_id: str, record_id: str, record_name: str, new_ip: str
         return
 
     result = response.json()
-    result = result.get("result")
+    result.get("result")
     log(f"DNS record updated: [name: {record_name}, ip: {new_ip}]")
 
 
 def main():
-    cache = FileCache("cloudflare_update", flag="cs", app_cache_dir="/tmp/cf_updater")
     current_ip = get_my_ip()
-
-    zone_id = cache.get("zone_id")
-    if zone_id is None:
-        zone_id = get_zone_id()
-        cache["zone_id"] = zone_id
+    zone_id = get_zone_id()
 
     for record in record_names:
         rec_name = record.get("domain")
+        rec_name = f"{rec_name}.{zone_name}"
         rec_proxied = record.get("proxied")
-
-        rec_id = cache.get(f"record_id_{rec_name}")
-        if rec_id is None:
-            rec_id = get_record_id(zone_id=zone_id, record_name=f"{rec_name}.{zone_name}")
-            cache[f"record_id_{rec_name}"] = rec_id
+        rec_id = get_record_id(zone_id=zone_id, record_name=rec_name)
 
         last_ip = cache.get(f"last_ip_{rec_name}")
         if last_ip == current_ip:
-            log(f"IP has not changed. No update needed. [{rec_name}.{zone_name} | {current_ip}]")
+            log(f"IP has not changed. No update needed. [{rec_name} | {current_ip}]")
             continue
         log(f"IP has changed. [old: {last_ip} | new: {current_ip}]")
 
         update_domain_ip(
             zone_id=zone_id,
             record_id=rec_id,
-            record_name=f"{rec_name}.{zone_name}",
+            record_name=rec_name,
             new_ip=current_ip,
-            with_cloud=rec_proxied,
+            proxied=rec_proxied,
         )
 
         cache[f"last_ip_{rec_name}"] = current_ip
